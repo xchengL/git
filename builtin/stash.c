@@ -34,6 +34,7 @@ static const char * const git_stash_usage[] = {
 	N_("git stash save [-p|--patch] [-S|--staged] [-k|--[no-]keep-index] [-q|--quiet]\n"
 	   "          [-u|--include-untracked] [-a|--all] [<message>]"),
 	N_("git stash export (--print | --to-ref <ref>) [<stashes>]"),
+	N_("git stash import <commit>"),
 	NULL
 };
 
@@ -95,6 +96,10 @@ static const char * const git_stash_export_usage[] = {
 	NULL
 };
 
+static const char * const git_stash_import_usage[] = {
+	N_("git stash import <commit>"),
+	NULL
+};
 
 static const char ref_stash[] = "refs/stash";
 static struct strbuf stash_index_path = STRBUF_INIT;
@@ -104,6 +109,7 @@ static struct strbuf stash_index_path = STRBUF_INIT;
  * b_commit is set to the base commit
  * i_commit is set to the commit containing the index tree
  * u_commit is set to the commit containing the untracked files tree
+ * c_commit is set to the first parent (chain commit) when importing and is otherwise unset
  * w_tree is set to the working tree
  * b_tree is set to the base tree
  * i_tree is set to the index tree
@@ -114,6 +120,7 @@ struct stash_info {
 	struct object_id b_commit;
 	struct object_id i_commit;
 	struct object_id u_commit;
+	struct object_id c_commit;
 	struct object_id w_tree;
 	struct object_id b_tree;
 	struct object_id i_tree;
@@ -136,6 +143,32 @@ static void assert_stash_like(struct stash_info *info, const char *revision)
 	    get_oidf(&info->b_tree, "%s^1:", revision) ||
 	    get_oidf(&info->i_tree, "%s^2:", revision))
 		die(_("'%s' is not a stash-like commit"), revision);
+}
+
+static int get_stash_info_for_import(struct stash_info *info, const struct object_id *oid)
+{
+	int has_parents;
+	char hexoid[GIT_MAX_HEXSZ + 1];
+	oid_to_hex_r(hexoid, oid);
+
+	oidcpy(&info->w_commit, oid);
+	if (get_oidf(&info->w_tree, "%s:", hexoid))
+		return -1;
+
+	has_parents = !get_oidf(&info->c_commit, "%s^1", hexoid);
+
+	/* If this tree is the empty one and we have no parents, we've reached the end. */
+	if (oideq(&info->w_tree, the_hash_algo->empty_tree) && !has_parents)
+		return 1;
+	if (get_oidf(&info->b_commit, "%s^2", hexoid) ||
+	    get_oidf(&info->i_commit, "%s^3", hexoid) ||
+	    get_oidf(&info->b_tree, "%s^2:", hexoid) ||
+	    get_oidf(&info->i_tree, "%s^3:", hexoid))
+		return -1;
+
+	info->has_u = !get_oidf(&info->u_commit, "%s^4", hexoid) &&
+		      !get_oidf(&info->u_tree, "%s^4:", hexoid);
+	return 0;
 }
 
 static int get_stash_info_1(struct stash_info *info, const char *commit, int quiet)
@@ -1827,6 +1860,96 @@ out:
 	return msg;
 }
 
+static int do_import_stash(const char *rev)
+{
+	struct object_id oid;
+	size_t nitems = 0, nalloc = 0;
+	struct stash_info *items = NULL;
+	int res = 0;
+
+	if (get_oid(rev, &oid))
+		return error(_("not a valid revision: %s"), rev);
+
+	/*
+	 * Walk the commit history, finding each stash entry, and load data into
+	 * the array.
+	 */
+	for (size_t i = 0;; i++, nitems++) {
+		int ret;
+
+		if (nalloc <= i) {
+			size_t new = nalloc * 3 / 2 + 5;
+			items = xrealloc(items, new * sizeof(*items));
+			nalloc = new;
+		}
+		memset(&items[i], 0, sizeof(*items));
+		/* We want this to be quiet because it might not exist. */
+		ret = get_stash_info_for_import(&items[i], &oid);
+		if (ret < 0)
+			return error(_("%s is not a valid exported stash commit"), oid_to_hex(&oid));
+		if (ret)
+			break;
+		oidcpy(&oid, &items[i].c_commit);
+	}
+
+	/*
+	 * Now, walk each entry, adding it to the stash as a normal stash
+	 * commit.
+	 */
+	for (ssize_t i = nitems - 1; i >= 0; i--) {
+		struct commit_list *parents = NULL;
+		struct commit_list **next = &parents;
+		struct object_id out;
+		char *msg;
+
+		next = commit_list_append(lookup_commit_reference(the_repository, &items[i].b_commit), next);
+		next = commit_list_append(lookup_commit_reference(the_repository, &items[i].i_commit), next);
+		if (items[i].has_u)
+			next = commit_list_append(lookup_commit_reference(the_repository,
+								   &items[i].u_commit),
+						  next);
+
+		msg = write_commit_with_parents(&out, &items[i], parents);
+		if (!msg) {
+			res = -1;
+			goto out;
+		}
+		if (do_store_stash(&out, msg, 1)) {
+			free(msg);
+			res = -1;
+			error(_("Cannot save the current status"));
+			goto out;
+		}
+		free(msg);
+	}
+out:
+	for (size_t i = 0; i < nitems; i++) {
+		free_stash_info(&items[i]);
+	}
+	free(items);
+
+	return res;
+}
+
+static int import_stash(int argc, const char **argv, const char *prefix)
+{
+	int ret = 0;
+	struct option options[] = {
+		OPT_END()
+	};
+
+	argc = parse_options(argc, argv, prefix, options,
+			     git_stash_import_usage,
+			     PARSE_OPT_KEEP_DASHDASH);
+
+	if (argc != 1)
+		return error(_("a revision to import from is required"));
+
+
+	ret = do_import_stash(argv[0]);
+	return ret;
+}
+
 static int do_export_stash(const char *ref, size_t argc, const char **argv)
 {
 	struct object_id base;
@@ -1996,6 +2119,8 @@ int cmd_stash(int argc, const char **argv, const char *prefix)
 		return !!save_stash(argc, argv, prefix);
 	else if (!strcmp(argv[0], "export"))
 		return !!export_stash(argc, argv, prefix);
+	else if (!strcmp(argv[0], "import"))
+		return !!import_stash(argc, argv, prefix);
 	else if (*argv[0] != '-')
 		usage_msg_optf(_("unknown subcommand: %s"),
 			       git_stash_usage, options, argv[0]);
