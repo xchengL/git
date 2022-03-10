@@ -124,6 +124,7 @@ static void free_stash_info(struct stash_info *info)
 static void assert_stash_like(struct stash_info *info, const char *revision)
 {
 	if (get_oidf(&info->b_commit, "%s^1", revision) ||
+	    get_oidf(&info->i_commit, "%s^2", revision) ||
 	    get_oidf(&info->w_tree, "%s:", revision) ||
 	    get_oidf(&info->b_tree, "%s^1:", revision) ||
 	    get_oidf(&info->i_tree, "%s^2:", revision))
@@ -166,7 +167,8 @@ static int get_stash_info_1(struct stash_info *info, const char *commit, int qui
 
 	assert_stash_like(info, revision);
 
-	info->has_u = !get_oidf(&info->u_tree, "%s^3:", revision);
+	info->has_u = !get_oidf(&info->u_commit, "%s^3", revision) &&
+		      !get_oidf(&info->u_tree, "%s^3:", revision);
 
 	end_of_rev = strchrnul(revision, '@');
 	strbuf_add(&symbolic, revision, end_of_rev - revision);
